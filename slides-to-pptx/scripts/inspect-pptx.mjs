@@ -23,6 +23,9 @@
  *   --quiet               Lint findings only, no per-shape listing
  *   --overlap <pct>       Overlap area, as % of the smaller box, that counts (default 25)
  *   --min-font <pt>       Font size below which to warn (default 8)
+ *   --min-contrast <n>    Text/background contrast below which to warn (default 3)
+ *   --fail-contrast <n>   Text/background contrast below which to fail (default 2)
+ *   --no-contrast         Skip text/background contrast sampling
  *
  * No office suite is involved: everything here comes from the OOXML and from the same
  * headless Chromium the converter already depends on.
@@ -53,7 +56,10 @@ try {
 /* ── CLI ────────────────────────────────────────────────── */
 
 const argv = process.argv.slice(2);
-const opts = { preview: null, slides: null, json: false, quiet: false, overlap: 25, minFont: 8 };
+const opts = {
+  preview: null, slides: null, json: false, quiet: false, overlap: 25,
+  minFont: 8, minContrast: 3, failContrast: 2, contrast: true,
+};
 const positional = [];
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
@@ -63,6 +69,9 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--quiet') opts.quiet = true;
   else if (a === '--overlap') opts.overlap = Number(argv[++i]);
   else if (a === '--min-font') opts.minFont = Number(argv[++i]);
+  else if (a === '--min-contrast') opts.minContrast = Number(argv[++i]);
+  else if (a === '--fail-contrast') opts.failContrast = Number(argv[++i]);
+  else if (a === '--no-contrast') opts.contrast = false;
   else if (a.startsWith('--')) { console.error(`Unknown option: ${a}`); process.exit(2); }
   else positional.push(a);
 }
@@ -204,6 +213,7 @@ for (const [i, name] of slideNames.entries()) {
       .map((p) => p.runs.map((r) => (r.break ? '\n' : r.text)).join(''))
       .join('\n');
     shapes.push({
+      index: shapes.length + 1,
       geo, wrap, paragraphs, text: plain,
       hasInk: plain.trim().length > 0,
       // A fully transparent run is a searchable-mode text layer, not visible content.
@@ -221,6 +231,47 @@ for (const [i, name] of slideNames.entries()) {
 const findings = [];
 const inches = (emu) => Math.round((emu / EMU_PER_IN) * 100) / 100;
 const pctOf = (a, b) => Math.round((a / b) * 100);
+
+function normalizeHex(hex) {
+  if (!hex) return '000000';
+  return hex.replace(/^#/, '').toUpperCase().padStart(6, '0').slice(0, 6);
+}
+
+function hexToRgb(hex) {
+  const value = normalizeHex(hex);
+  return [0, 2, 4].map((i) => parseInt(value.slice(i, i + 2), 16));
+}
+
+function rgbToHex(rgb) {
+  return rgb.map((v) => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0')).join('').toUpperCase();
+}
+
+function luminance(rgb) {
+  const [r, g, b] = rgb.map((v) => {
+    const c = v / 255;
+    return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+function contrastRatio(fgHex, bgRgb) {
+  const fg = luminance(hexToRgb(fgHex));
+  const bg = luminance(bgRgb);
+  const light = Math.max(fg, bg);
+  const dark = Math.min(fg, bg);
+  return (light + 0.05) / (dark + 0.05);
+}
+
+function visibleTextColors(shape) {
+  const colors = new Set();
+  for (const p of shape.paragraphs) {
+    for (const r of p.runs) {
+      if (!r.text?.trim() || r.opacity < 50) continue;
+      colors.add(normalizeHex(r.color));
+    }
+  }
+  return [...colors];
+}
 
 /** Overlap area of two EMU rects. */
 function overlapArea(a, b) {
@@ -285,6 +336,98 @@ for (const s of slides) {
     findings.push({ level: 'fail', slide: s.number, kind: 'empty', message: 'slide has no pictures and no text' });
   }
 }
+
+async function runContrastInspection() {
+  if (!opts.contrast || !slides.some((s) => s.shapes.some((sh) => sh.geo && sh.visible && visibleTextColors(sh).length))) return;
+
+  const PX_W = 1920;
+  const PX_PER_EMU = PX_W / DECK.cx;
+  const PX_H = Math.round(DECK.cy * PX_PER_EMU);
+  const px = (emu) => emu * PX_PER_EMU;
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage();
+
+  try {
+    for (const s of slides) {
+      const checks = s.shapes
+        .filter((sh) => sh.geo && sh.visible)
+        .map((sh) => ({
+          index: sh.index,
+          text: sh.text.replace(/\s+/g, ' ').trim().slice(0, 60),
+          x: px(sh.geo.x), y: px(sh.geo.y), w: px(sh.geo.w), h: px(sh.geo.h),
+          colors: visibleTextColors(sh),
+        }))
+        .filter((sh) => sh.colors.length);
+      if (!checks.length) continue;
+
+      const pictures = [];
+      for (const pic of s.pictures) {
+        if (!pic.geo || !pic.part || !zip.file(pic.part)) continue;
+        const buf = await zip.file(pic.part).async('nodebuffer');
+        const ext = pic.part.split('.').pop().toLowerCase();
+        const mime = ext === 'png' ? 'image/png' : ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : `image/${ext}`;
+        pictures.push({
+          src: `data:${mime};base64,${buf.toString('base64')}`,
+          x: px(pic.geo.x), y: px(pic.geo.y), w: px(pic.geo.w), h: px(pic.geo.h),
+        });
+      }
+
+      const sampled = await page.evaluate(async ({ width, height, pictures, checks }) => {
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, width, height);
+        const loadImage = (src) => new Promise((resolve, reject) => {
+          const img = new Image();
+          img.onload = () => resolve(img);
+          img.onerror = reject;
+          img.src = src;
+        });
+        for (const pic of pictures) {
+          const img = await loadImage(pic.src);
+          ctx.drawImage(img, pic.x, pic.y, pic.w, pic.h);
+        }
+        const samplePoints = (box) => {
+          const xs = [0.18, 0.5, 0.82];
+          const ys = [0.3, 0.5, 0.7];
+          const out = [];
+          for (const xf of xs) {
+            for (const yf of ys) {
+              const x = Math.max(0, Math.min(width - 1, Math.round(box.x + box.w * xf)));
+              const y = Math.max(0, Math.min(height - 1, Math.round(box.y + box.h * yf)));
+              out.push([...ctx.getImageData(x, y, 1, 1).data.slice(0, 3)]);
+            }
+          }
+          return out;
+        };
+        return checks.map((check) => ({ ...check, backgrounds: samplePoints(check) }));
+      }, { width: PX_W, height: PX_H, pictures, checks });
+
+      for (const check of sampled) {
+        for (const color of check.colors) {
+          let worst = { ratio: Infinity, bg: [255, 255, 255] };
+          for (const bg of check.backgrounds) {
+            const ratio = contrastRatio(color, bg);
+            if (ratio < worst.ratio) worst = { ratio, bg };
+          }
+          if (worst.ratio >= opts.minContrast) continue;
+          findings.push({
+            level: worst.ratio < opts.failContrast ? 'fail' : 'warn',
+            slide: s.number,
+            kind: 'low-contrast',
+            message: `${worst.ratio.toFixed(2)}:1 contrast for #${color} text on #${rgbToHex(worst.bg)} background: "${check.text}"`,
+          });
+        }
+      }
+    }
+  } finally {
+    await browser.close();
+  }
+}
+
+await runContrastInspection();
 
 /* ── Preview render ─────────────────────────────────────── */
 
@@ -393,6 +536,7 @@ if (opts.json) {
         wrap: sh.wrap, visible: sh.visible, hyperlink: sh.hyperlink, text: sh.text,
         fonts: [...new Set(sh.paragraphs.flatMap((p) => p.runs.map((r) => r.font).filter(Boolean)))],
         sizes: [...new Set(sh.paragraphs.flatMap((p) => p.runs.map((r) => r.pt).filter(Boolean)))],
+        colors: visibleTextColors(sh),
       })),
     })),
     findings, previews: previewFiles, ok: fails.length === 0,

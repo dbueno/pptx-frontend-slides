@@ -698,8 +698,9 @@ function extractSlide(args) {
 
 /**
  * Hide text for the editable-mode background capture.
- * `visibility` is inherited but overridable, so hiding a text root and re-showing its
- * media descendants keeps icons/images in the artwork while dropping the glyphs.
+ * Preserve the element boxes themselves: backgrounds, borders and shadows are artwork.
+ * Only the glyph fill is masked so text containers such as cards do not disappear from
+ * the background screenshot.
  */
 function toggleTextVisibility(args) {
   const { selector, index, hide, hideImages } = args;
@@ -722,21 +723,47 @@ function toggleTextVisibility(args) {
     return false;
   };
 
+  const MASK_KEY = '__slidesPptxTextMask';
+  window[MASK_KEY] ||= new WeakMap();
+  const masked = window[MASK_KEY];
+  const STYLE_PROPS = ['-webkit-text-fill-color', 'text-shadow'];
+  const MEDIA = new Set(['IMG', 'SVG', 'VIDEO', 'CANVAS', 'PICTURE', 'SOURCE']);
+  const maskGlyphs = (root) => {
+    const targets = [root, ...root.querySelectorAll('*')].filter((node) => !MEDIA.has(node.tagName));
+    for (const node of targets) {
+      if (!masked.has(node)) {
+        const saved = {};
+        for (const prop of STYLE_PROPS) {
+          saved[prop] = {
+            value: node.style.getPropertyValue(prop),
+            priority: node.style.getPropertyPriority(prop),
+          };
+        }
+        masked.set(node, saved);
+      }
+      node.style.setProperty('-webkit-text-fill-color', 'transparent', 'important');
+      node.style.setProperty('text-shadow', 'none', 'important');
+    }
+  };
+  const restoreGlyphs = (root) => {
+    const targets = [root, ...root.querySelectorAll('*')].filter((node) => !MEDIA.has(node.tagName));
+    for (const node of targets) {
+      const saved = masked.get(node);
+      if (!saved) continue;
+      for (const prop of STYLE_PROPS) {
+        const prev = saved[prop];
+        if (prev.value) node.style.setProperty(prop, prev.value, prev.priority);
+        else node.style.removeProperty(prop);
+      }
+      masked.delete(node);
+    }
+  };
+
   let n = 0;
   for (const el of slide.querySelectorAll('*')) {
     if (!isBox(el) || !ownsText(el)) continue;
-    if (hide) {
-      el.style.setProperty('visibility', 'hidden', 'important');
-      // Keep real media visible — only the glyphs should disappear.
-      for (const media of el.querySelectorAll('img, svg, video, canvas, picture')) {
-        media.style.setProperty('visibility', 'visible', 'important');
-      }
-    } else {
-      el.style.removeProperty('visibility');
-      for (const media of el.querySelectorAll('img, svg, video, canvas, picture')) {
-        media.style.removeProperty('visibility');
-      }
-    }
+    if (hide) maskGlyphs(el);
+    else restoreGlyphs(el);
     n++;
   }
   if (hideImages) {
@@ -998,6 +1025,10 @@ await pptx.writeFile({ fileName: OUTPUT });
       notesMasterIdLst after sldIdLst.
    2. CT_TextParagraph allows at most one <a:pPr>, as the first child.
       pptxgenjs repeats it before every run in a multi-run paragraph.
+   3. pptxgenjs can leave stale content-type overrides behind for parts that no
+      longer exist after master/layout de-duplication. PowerPoint repairs those.
+   4. Zip directory entries are harmless to most readers but are noise in a PPTX
+      package and PowerPoint rewrites them during repair.
    ═══════════════════════════════════════════════════════════ */
 
 const zip = await JSZip.loadAsync(await readFile(OUTPUT));
@@ -1033,6 +1064,33 @@ for (const name of Object.keys(zip.files)) {
   if (changed) zip.file(name, fixed);
 }
 if (dupParagraphs) repairs.push(`${dupParagraphs} duplicate <a:pPr>`);
+
+// --- 3. Stale content-type overrides ---
+let contentTypesXml = await zip.file('[Content_Types].xml')?.async('string');
+if (contentTypesXml) {
+  let staleOverrides = 0;
+  const fixed = contentTypesXml.replace(/<Override\s+PartName="([^"]+)"\s+ContentType="[^"]+"\s*\/>/g, (entry, partName) => {
+    const zipName = partName.replace(/^\//, '');
+    if (zip.file(zipName)) return entry;
+    staleOverrides++;
+    return '';
+  });
+  if (staleOverrides) {
+    zip.file('[Content_Types].xml', fixed);
+    repairs.push(`${staleOverrides} stale content-type override${staleOverrides === 1 ? '' : 's'}`);
+  }
+}
+
+// --- 4. Directory entries ---
+let directoryEntries = 0;
+for (const [name, entry] of Object.entries(zip.files)) {
+  if (!entry.dir) continue;
+  // JSZip#remove('ppt/') recursively removes all children. We only want to drop
+  // the explicit directory record from the central directory, not the files below it.
+  delete zip.files[name];
+  directoryEntries++;
+}
+if (directoryEntries) repairs.push(`${directoryEntries} zip director${directoryEntries === 1 ? 'y' : 'ies'}`);
 
 const repaired = repairs.length > 0;
 if (repaired) {
