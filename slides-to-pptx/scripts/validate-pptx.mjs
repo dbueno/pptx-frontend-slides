@@ -10,7 +10,6 @@
  *   --expect-slides <n>    Fail if the slide count differs
  *   --expect-text          Fail if any slide has no text runs (searchable/editable modes)
  *   --no-schema            Skip the OOXML schema pass (which needs npx + network once)
- *   --render-check <dir>   Round-trip render with LibreOffice and compare page count
  *   --json                 Emit machine-readable results
  *
  * Checks, in order of how much they actually catch:
@@ -19,15 +18,15 @@
  *   3. Slide inventory     — slide parts vs sldIdLst, media per slide, notes, text runs
  *   4. Blank-art heuristic — flags slide images small enough to be a flat blank frame
  *   5. OOXML schema        — ECMA-376 validation via @xarsh/ooxml-validator
- *   6. Render round-trip   — optional LibreOffice conversion proves a real renderer opens it
+ *
+ * Layout correctness is a separate question — see scripts/inspect-pptx.mjs.
  */
 
 import { readFile } from 'fs/promises';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'fs';
+import { existsSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { resolve, join } from 'path';
 import { createRequire } from 'module';
-import { tmpdir } from 'os';
 
 // See html2pptx.mjs — SLIDES_PPTX_DEPS points at the shared dependency cache.
 let JSZip;
@@ -43,20 +42,19 @@ try {
 /* ── CLI ────────────────────────────────────────────────── */
 
 const argv = process.argv.slice(2);
-const opts = { schema: true, json: false, expectSlides: null, expectText: false, renderCheck: null };
+const opts = { schema: true, json: false, expectSlides: null, expectText: false };
 const positional = [];
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === '--expect-slides') opts.expectSlides = Number(argv[++i]);
   else if (a === '--expect-text') opts.expectText = true;
   else if (a === '--no-schema') opts.schema = false;
-  else if (a === '--render-check') opts.renderCheck = argv[++i] || 'auto';
   else if (a === '--json') opts.json = true;
   else if (a.startsWith('--')) { console.error(`Unknown option: ${a}`); process.exit(2); }
   else positional.push(a);
 }
 if (!positional.length) {
-  console.error('Usage: node validate-pptx.mjs <file.pptx> [--expect-slides N] [--expect-text] [--no-schema] [--render-check]');
+  console.error('Usage: node validate-pptx.mjs <file.pptx> [--expect-slides N] [--expect-text] [--no-schema]');
   process.exit(2);
 }
 const FILE = resolve(positional[0]);
@@ -263,38 +261,9 @@ if (opts.schema) {
   }
 }
 
-/* ── 6. Render round-trip (optional, needs LibreOffice) ──── */
-
-if (opts.renderCheck) {
-  const candidates = ['soffice', '/Applications/LibreOffice.app/Contents/MacOS/soffice', '/usr/bin/soffice', '/usr/bin/libreoffice'];
-  let soffice = null;
-  for (const c of candidates) {
-    try { execFileSync(c, ['--version'], { stdio: 'ignore', timeout: 60000 }); soffice = c; break; } catch {}
-  }
-  if (!soffice) {
-    info.render = { skipped: true, reason: 'LibreOffice not found' };
-    warn('render check skipped: LibreOffice not installed (brew install --cask libreoffice)');
-  } else {
-    const out = mkdtempSync(join(tmpdir(), 'pptx-render-'));
-    try {
-      execFileSync(soffice, ['--headless', '--convert-to', 'pdf', '--outdir', out, FILE], { stdio: 'ignore', timeout: 300000 });
-      const pdf = readdirSync(out).find((f) => f.endsWith('.pdf'));
-      if (!pdf) { fail('render check: LibreOffice produced no PDF — the file may be unopenable'); }
-      else {
-        const buf = await readFile(join(out, pdf));
-        const pages = [...buf.toString('latin1').matchAll(/\/Type\s*\/Page[^s]/g)].length;
-        info.render = { engine: 'libreoffice', pdfPages: pages, pdfBytes: buf.length };
-        if (pages && pages !== slideParts.length) {
-          fail(`render check: PDF has ${pages} pages but the deck has ${slideParts.length} slides`);
-        }
-      }
-    } catch (e) {
-      fail(`render check: LibreOffice failed to convert the file (${e.message.split('\n')[0]})`);
-    } finally {
-      rmSync(out, { recursive: true, force: true });
-    }
-  }
-}
+/* Layout correctness — whether text sits where it should — is checked by
+   scripts/inspect-pptx.mjs, which reads the emitted geometry and renders a preview
+   in the same headless Chromium the converter already uses. */
 
 /* ── Report ─────────────────────────────────────────────── */
 
@@ -311,7 +280,6 @@ if (opts.json) {
   }
   if (info.schema?.ok) console.log('  schema: valid (ECMA-376)');
   else if (info.schema?.skipped) console.log('  schema: skipped');
-  if (info.render && !info.render.skipped) console.log(`  render: LibreOffice produced ${info.render.pdfPages} pages`);
   console.log('');
   for (const w of warnings) console.log(`  ⚠ ${w}`);
   for (const p of problems) console.log(`  ✗ ${p}`);

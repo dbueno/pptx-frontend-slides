@@ -19,14 +19,18 @@
 #   --font-map "Clash Display=Impact"  Override the built-in webfont substitutions
 #   --selector <css>                   Slide selector if the deck does not use .slide
 #   --no-notes / --no-links            Skip speaker notes / hyperlink hotspots
+#   --no-shrink                        editable mode: keep authored font sizes even where
+#                                      the substituted font overflows its box
 #   --skip-validate                    Convert only, do not run the validator
-#   --render-check                     Also round-trip through LibreOffice (if installed)
+#   --preview <dir>                    Also render each emitted slide to <dir>/slide-NNN.png
+#   --no-inspect                       Skip the layout inspection pass
 #
 # What this does:
 #   1. Installs Node deps (playwright, pptxgenjs, jszip) into a cached local dir
 #   2. Serves the deck over HTTP and drives it in headless Chromium
 #   3. Captures each slide at its authored stage size and builds the .pptx
 #   4. Validates package structure, deck geometry and OOXML schema
+#   5. Inspects the emitted layout for off-slide text, collisions and tiny fonts
 set -euo pipefail
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[1;33m'
@@ -40,21 +44,25 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ─── Parse arguments ──────────────────────────────────────
 SKIP_VALIDATE=false
-RENDER_CHECK=false
+SKIP_INSPECT=false
+PREVIEW_DIR=""
+MODE=image
 POSITIONAL=()
 PASSTHROUGH=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --skip-validate) SKIP_VALIDATE=true; shift ;;
-        --render-check)  RENDER_CHECK=true; shift ;;
+        --no-inspect)    SKIP_INSPECT=true; shift ;;
+        --preview)       PREVIEW_DIR="$2"; shift 2 ;;
+        --mode)          MODE="$2"; PASSTHROUGH+=("$1" "$2"); shift 2 ;;
         # Options that take a value
-        --mode|--scale|--selector|--font-map|--keep-shots|--title|--author|--company|--subject)
+        --scale|--selector|--font-map|--keep-shots|--title|--author|--company|--subject)
             PASSTHROUGH+=("$1" "$2"); shift 2 ;;
         --jpeg)
             PASSTHROUGH+=("$1"); shift
             if [[ ${1:-} =~ ^[0-9]+$ ]]; then PASSTHROUGH+=("$1"); shift; fi ;;
-        --native-images|--keep-chrome|--no-notes|--no-links)
+        --native-images|--keep-chrome|--no-notes|--no-links|--no-shrink)
             PASSTHROUGH+=("$1"); shift ;;
         -*) err "Unknown option: $1"; exit 1 ;;
         *)  POSITIONAL+=("$1"); shift ;;
@@ -134,13 +142,27 @@ if [[ "$SKIP_VALIDATE" == "false" ]]; then
     echo ""
     info "Validating the .pptx..."
     VALIDATE_ARGS=()
-    [[ "$RENDER_CHECK" == "true" ]] && VALIDATE_ARGS+=(--render-check auto)
     # Editable and searchable decks must carry real text; image decks legitimately do not.
-    if printf '%s\n' "${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}" | grep -qE '^(searchable|editable)$'; then
+    if [[ "$MODE" == "searchable" || "$MODE" == "editable" ]]; then
         VALIDATE_ARGS+=(--expect-text)
     fi
     if ! node "$SCRIPT_DIR/validate-pptx.mjs" "$OUTPUT_PPTX" "${VALIDATE_ARGS[@]+"${VALIDATE_ARGS[@]}"}"; then
         warn "Validation reported problems — see above before sharing this file."
+        exit 1
+    fi
+fi
+
+# ─── Inspect the layout ───────────────────────────────────
+# Validation proves the package is well-formed; this proves the content landed where it
+# should. Reads the emitted geometry and, with --preview, renders it back to PNGs.
+
+if [[ "$SKIP_INSPECT" == "false" ]]; then
+    echo ""
+    info "Inspecting the emitted layout..."
+    INSPECT_ARGS=(--quiet)
+    [[ -n "$PREVIEW_DIR" ]] && INSPECT_ARGS+=(--preview "$PREVIEW_DIR")
+    if ! node "$SCRIPT_DIR/inspect-pptx.mjs" "$OUTPUT_PPTX" "${INSPECT_ARGS[@]}"; then
+        warn "Layout inspection found problems — see above before sharing this file."
         exit 1
     fi
 fi
@@ -157,7 +179,7 @@ echo ""
 echo -e "${BOLD}════════════════════════════════════════${NC}"
 echo ""
 
-# Best-effort preview — no PowerPoint/LibreOffice installed is not a failure.
+# Best-effort open in whatever the user has — nothing installed is not a failure.
 if command -v open >/dev/null 2>&1; then
     open "$OUTPUT_PPTX" 2>/dev/null || info "No installed app claims .pptx — the file is still valid."
 fi

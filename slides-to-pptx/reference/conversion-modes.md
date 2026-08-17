@@ -66,6 +66,10 @@ reuse individual slides. Positions and sizes are exact — a 120px slide padding
 
 - **Fonts are substituted.** Fontshare/Google webfonts are not installed on the recipient's
   machine. See [font-mapping.md](font-mapping.md). This is the dominant fidelity loss.
+- **Some text is a little smaller than authored.** A stand-in font with different metrics
+  reflows, so each box is measured again with the substitute applied and its font size stepped
+  down until it fits, to a floor of 80%. The conversion reports how many boxes were adjusted and
+  names any that still do not fit; `--no-shrink` keeps authored sizes and accepts the overflow.
 - **Text effects do not transfer.** Gradient-filled text (`background-clip: text`), text
   shadows, outlined text, and variable-font weights become flat solid-colour text.
 - **Layout is frozen.** Text boxes are absolutely positioned. Editing text longer than the
@@ -75,8 +79,9 @@ reuse individual slides. Positions and sizes are exact — a 120px slide padding
 pictures. Without it, images stay baked into the background. Note that `object-fit`, CSS
 `border-radius` and `box-shadow` on images are approximated.
 
-**Pick it when:** a human must edit the words. Then **always verify visually** — this is the one
-mode that can look wrong.
+**Pick it when:** a human must edit the words. Then **always inspect it** — this is the one mode
+that can look wrong. Run with `--preview <dir>` and read the lint findings; see
+[inspection.md](inspection.md).
 
 ## What every mode drops
 

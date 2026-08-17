@@ -21,9 +21,13 @@ Mapped to fonts that ship with Microsoft Office on **both** macOS and Windows.
 | ------- | ---------- | --- |
 | Clash Display | Impact | Heavy, tight, display-weight |
 | Oswald, Bebas Neue, Anton | Impact | Condensed display |
-| Satoshi, Switzer, General Sans, Space Grotesk | Verdana | Neutral geometric sans, generous width |
+| Satoshi, Switzer, General Sans, Space Grotesk | Arial | Neutral grotesque, and close in width — Verdana is the obvious visual match but is far wider, which reflows every box it touches |
 | Cabinet Grotesk, Chillax, Poppins, Montserrat | Trebuchet MS | Rounder humanist sans |
 | Inter, Roboto, Archivo | Arial | Neutral grotesque |
+
+Width is weighted over shape here on purpose. A substitute one class wider re-wraps text that
+fitted its box in the browser, and a reflowed line is a much louder defect than a slightly
+different letterform.
 | Zodiak, Sentient, Gambetta, Bespoke Serif | Georgia | Contrast serif |
 | Playfair Display, DM Serif Display, Libre Baskerville, Lora | Georgia | Serif |
 | JetBrains Mono, IBM Plex Mono, Space Mono, Fira Code | Consolas | Monospace |

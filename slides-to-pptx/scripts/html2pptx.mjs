@@ -15,6 +15,8 @@
  *   --font-map "A=B,C=D"                 Substitute webfont A with Office font B
  *   --no-notes                           Skip speaker notes
  *   --no-links                           Skip hyperlink hotspots
+ *   --no-shrink                          editable mode: do not shrink text that a
+ *                                        substituted font would overflow out of its box
  *   --title/--author/--company/--subject Document metadata
  *   --keep-shots <dir>                   Keep the source screenshots (for validation)
  *   --json                               Print a machine-readable summary to stdout
@@ -84,6 +86,7 @@ const opts = {
   meta: {},
   keepShots: null,
   json: false,
+  shrink: true,
 };
 const positional = [];
 
@@ -109,6 +112,7 @@ for (let i = 0; i < argv.length; i++) {
       break;
     case '--no-notes': opts.notes = false; break;
     case '--no-links': opts.links = false; break;
+    case '--no-shrink': opts.shrink = false; break;
     case '--title': opts.meta.title = next(); break;
     case '--author': opts.meta.author = next(); break;
     case '--company': opts.meta.company = next(); break;
@@ -176,6 +180,36 @@ const server = createServer((req, res) => {
   }
 });
 const port = await new Promise((r) => server.listen(0, () => r(server.address().port)));
+
+/* ═══════════════════════════════════════════════════════════
+   FONT SUBSTITUTION
+   Webfonts do not exist on the viewer's machine. Map them to fonts that ship with
+   Office on both macOS and Windows so substitution is predictable, not arbitrary.
+   Prefer substitutes with similar *widths* — a wider stand-in reflows every text box
+   and is the main source of overflow in editable mode.
+   ═══════════════════════════════════════════════════════════ */
+
+const DEFAULT_FONT_MAP = {
+  'clash display': 'Impact', 'satoshi': 'Arial', 'space grotesk': 'Arial',
+  'general sans': 'Arial', 'cabinet grotesk': 'Trebuchet MS', 'switzer': 'Arial',
+  'chillax': 'Trebuchet MS', 'zodiak': 'Georgia', 'sentient': 'Georgia',
+  'gambetta': 'Georgia', 'bespoke serif': 'Georgia', 'playfair display': 'Georgia',
+  'dm serif display': 'Georgia', 'libre baskerville': 'Georgia', 'lora': 'Georgia',
+  'inter': 'Arial', 'roboto': 'Arial', 'poppins': 'Trebuchet MS',
+  'montserrat': 'Trebuchet MS', 'archivo': 'Arial', 'oswald': 'Impact',
+  'bebas neue': 'Impact', 'anton': 'Impact', 'jetbrains mono': 'Consolas',
+  'ibm plex mono': 'Consolas', 'space mono': 'Consolas', 'fira code': 'Consolas',
+  'courier prime': 'Courier New',
+};
+// Resolved map actually handed to the page and to the builder, keyed by lowercase family.
+const FONT_MAP = { ...DEFAULT_FONT_MAP, ...opts.fontMap };
+const substitutions = new Map();
+function mapFont(name) {
+  if (!name) return 'Arial';
+  const mapped = FONT_MAP[name.toLowerCase()];
+  if (mapped) { substitutions.set(name, mapped); return mapped; }
+  return name; // already an Office-safe or locally installed family
+}
 
 /* ═══════════════════════════════════════════════════════════
    BROWSER-SIDE HELPERS
@@ -261,7 +295,7 @@ async function showSlide(args) {
  * Coordinates come back in authored stage pixels with the slide's origin at (0,0).
  */
 function extractSlide(args) {
-  const { selector, index, wantNotes, wantLinks } = args;
+  const { selector, index, wantNotes, wantLinks, wantFit, fontMap } = args;
   const slide = document.querySelectorAll(selector)[index];
   if (!slide) return null;
 
@@ -284,10 +318,28 @@ function extractSlide(args) {
     return r.width > 0.5 && r.height > 0.5;
   };
 
-  // An element is a "text box root" when it is not purely inline and owns text that
-  // isn't claimed by a nested box. Inline descendants become formatting runs.
-  const INLINE_ONLY = new Set(['inline', 'contents', 'ruby', 'ruby-text', 'ruby-base']);
-  const isBox = (el) => !INLINE_ONLY.has(getComputedStyle(el).display);
+  // An element is a "text box root" when it is not laid out in its parent's inline flow
+  // and owns text that isn't claimed by a nested box root.
+  //
+  // inline-block/inline-flex/inline-grid count as inline flow: a mid-sentence badge or
+  // chip is positioned *by* the surrounding text, so lifting it into its own box makes
+  // the parent's words flow through the space it occupies and the two collide.
+  //
+  // And once inside such an element, everything below it is absorbed too — an
+  // inline-flex's own children are blockified to `block`, but the whole chip still
+  // occupies one contiguous span of the parent's line, so its parts cannot be
+  // positioned independently either.
+  const INLINE_FLOW = new Set(['inline', 'inline-block', 'inline-flex', 'inline-grid',
+    'inline-table', 'contents', 'ruby', 'ruby-text', 'ruby-base']);
+  const isInlineFlow = (el) => INLINE_FLOW.has(getComputedStyle(el).display);
+  const isBox = (el) => !isInlineFlow(el);
+  /** Already absorbed into an ancestor's text box, so not a root of its own. */
+  const absorbed = (el) => {
+    for (let p = el.parentElement; p && p !== slide; p = p.parentElement) {
+      if (isInlineFlow(p)) return true;
+    }
+    return false;
+  };
 
   const rgbToHex = (str) => {
     const m = str.match(/rgba?\(([^)]+)\)/);
@@ -324,33 +376,110 @@ function extractSlide(args) {
   /** Collect runs from a box root, stopping at nested box roots. */
   const collectRuns = (root) => {
     const runs = [];
-    const walk = (node, styleEl) => {
+    const hasInk = () => runs.some((r) => r.text && r.text.trim());
+
+    // Newlines become explicit break markers rather than "\n" inside a run:
+    // pptxgenjs splits runs on "\n" itself and reorders the pieces, which scrambles
+    // multi-run <pre> blocks into a single jumbled line.
+    const push = (text, style) => {
+      const lines = text.split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        if (i > 0) runs.push({ break: true });
+        if (lines[i]) runs.push({ text: lines[i], style });
+      }
+    };
+
+    const walk = (node, styleEl, inInline) => {
       for (const child of node.childNodes) {
         if (child.nodeType === Node.TEXT_NODE) {
           const st = runStyle(styleEl);
+          // CSS whitespace processing: `pre` keeps everything verbatim, otherwise a run
+          // of whitespace collapses to a single space. That surviving space is real
+          // content — `<b>a</b> <i>b</i>` renders "a b", so dropping whitespace-only
+          // text nodes glues words together and swallows the newlines between <pre> lines.
           const raw = st.pre ? child.nodeValue : child.nodeValue.replace(/\s+/g, ' ');
-          if (!raw.trim()) continue;
-          runs.push({ text: applyCase(raw, st.transform), style: st });
+          if (!raw) continue;
+          // Leading whitespace before any real text is layout, not content.
+          if (!st.pre && !raw.trim() && !hasInk()) continue;
+          push(applyCase(raw, st.transform), st);
         } else if (child.nodeType === Node.ELEMENT_NODE) {
           if (child.tagName === 'BR') { runs.push({ break: true }); continue; }
           const cs = getComputedStyle(child);
           if (cs.display === 'none' || cs.visibility === 'hidden') continue;
-          if (isBox(child)) continue; // owned by its own text box
-          walk(child, child);
+          const inline = isInlineFlow(child);
+          if (!inline && !inInline) continue; // a real block sibling — its own text box
+          // Blockified children of an inline chip are separated by flex/grid gaps rather
+          // than by whitespace, so keep a space or the words run together.
+          if (!inline && hasInk() && !/\s$/.test(runs[runs.length - 1]?.text || '')) {
+            runs.push({ text: ' ', style: runStyle(child) });
+          }
+          walk(child, child, true);
         }
       }
     };
-    walk(root, root);
+    walk(root, root, false);
+
+    // Trailing whitespace and dangling breaks would add a blank line to the box.
+    while (runs.length) {
+      const last = runs[runs.length - 1];
+      if (last.break || !last.text.trim()) runs.pop();
+      else break;
+    }
     return runs;
+  };
+
+  /**
+   * Union of the client rects of the text this element owns *directly* — the glyphs that
+   * will end up in its text box, excluding anything claimed by a nested box root.
+   * A flex or grid row's border box spans its children, so positioning the owned text by
+   * the element rect starts it underneath a sibling box instead of after it.
+   */
+  const ownedTextRect = (root) => {
+    let out = null;
+    const rows = new Set();
+    const add = (r) => {
+      if (!r || (r.width <= 0 && r.height <= 0)) return;
+      // Client rects come one per line fragment; bucket by top edge to count lines.
+      rows.add(Math.round(r.top));
+      out = out
+        ? { left: Math.min(out.left, r.left), top: Math.min(out.top, r.top),
+            right: Math.max(out.right, r.right), bottom: Math.max(out.bottom, r.bottom) }
+        : { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
+    };
+    const walk = (node, inInline) => {
+      for (const child of node.childNodes) {
+        if (child.nodeType === Node.TEXT_NODE) {
+          if (!child.nodeValue.trim()) continue;
+          const range = document.createRange();
+          range.selectNodeContents(child);
+          for (const r of range.getClientRects()) add(r);
+        } else if (child.nodeType === Node.ELEMENT_NODE) {
+          const cs = getComputedStyle(child);
+          if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+          const inline = isInlineFlow(child);
+          // Same absorption rule as collectRuns, or the rect would not cover the runs.
+          if (!inline && !inInline) continue;
+          walk(child, true);
+        }
+      }
+    };
+    walk(root, false);
+    if (!out) return null;
+    return {
+      left: out.left, top: out.top, width: out.right - out.left, height: out.bottom - out.top,
+      // Distinct line boxes the text occupies, so single-line text can be marked
+      // no-wrap and never reflowed by a renderer with different font metrics.
+      lines: rows.size,
+    };
   };
 
   /* ── Text boxes ─────────────────────────────────────────── */
   const texts = [];
   const textRoots = [];
   for (const el of slide.querySelectorAll('*')) {
-    if (!isBox(el) || !isVisible(el)) continue;
+    if (!isBox(el) || absorbed(el) || !isVisible(el)) continue;
     const runs = collectRuns(el);
-    if (!runs.some((r) => r.text)) continue;
+    if (!runs.some((r) => r.text && r.text.trim())) continue;
 
     const cs = getComputedStyle(el);
     const box = norm(el.getBoundingClientRect());
@@ -362,16 +491,161 @@ function extractSlide(args) {
     const lh = cs.lineHeight === 'normal' ? 0 : parseFloat(cs.lineHeight) || 0;
     const align = { start: 'left', end: 'right', 'justify': 'justify', center: 'center', right: 'right', left: 'left' }[cs.textAlign] || 'left';
 
+    let x = box.x + pad.l, y = box.y + pad.t;
+    let w = Math.max(box.w - pad.l - pad.r, 1);
+    let h = Math.max(box.h - pad.t - pad.b, 1);
+    // Text the browser laid out on one line must stay on one line. Sizing a box to
+    // exactly its own measured width means any renderer with slightly wider metrics
+    // wraps the last word onto a second line, which then collides with the box below.
+    let nowrap = false;
+
+    const ink = ownedTextRect(el);
+    if (ink) {
+      const i = norm(ink);
+      nowrap = ink.lines === 1;
+      // Does this element share its box with text that became a box of its own? A flex or
+      // grid container's border box spans all its children, so a text box drawn from it
+      // lies across its siblings, and its own words flow through the space they occupy.
+      // When that is the case the glyphs' own rect is the honest geometry.
+      //
+      // Everywhere else keep the content box: it is what the browser wrapped the text at,
+      // and the ink rect is not a reliable substitute — Chrome's range rects follow the
+      // font's ascent and descent, which overshoot the line box whenever a design sets
+      // `line-height` below 1, as display type usually does.
+      const shares = [...el.querySelectorAll('*')]
+        .some((d) => isBox(d) && !absorbed(d) && isVisible(d));
+      if (shares) {
+        x = Math.max(i.x, 0); y = Math.max(i.y, 0);
+        w = Math.max(i.w, 1); h = Math.max(i.h, 1);
+      }
+    }
+
     textRoots.push(el);
     texts.push({
-      x: box.x + pad.l, y: box.y + pad.t,
-      w: Math.max(box.w - pad.l - pad.r, 1),
-      h: Math.max(box.h - pad.t - pad.b, 1),
+      x, y, w, h, nowrap,
       align,
       lineHeightPx: lh,
       runs: runs.map((r) => (r.break ? { break: true } : { text: r.text, style: r.style })),
       plain: runs.map((r) => (r.break ? '\n' : r.text)).join('').trim(),
     });
+  }
+
+  /* ── Substituted-font fit ───────────────────────────────── */
+  // A stand-in font with different metrics reflows text onto more lines, so the words
+  // spill out of the box they were measured in and collide with the next one. Measure
+  // each box again with its substitute applied and record the largest font scale that
+  // still fits the authored bounds. The probe is an off-screen clone left in its real
+  // parent, so it inherits the true cascade without disturbing the visible layout.
+  if (wantFit) {
+    // Substitutes are Office fonts, which are often not installed on the machine doing
+    // the conversion (Consolas ships with Office, not with macOS). Naming the family on
+    // its own would fall back to the browser's default *proportional* font and measure
+    // something far narrower than a viewer will see, so pin a generic of the same class.
+    // Keep this classification in step with fontStack() in inspect-pptx.mjs.
+    const MONO = /consolas|courier|mono/i;
+    const SERIF = /georgia|times|cambria|garamond|serif/i;
+    const stack = (f) => `"${f}", ${MONO.test(f) ? 'monospace' : SERIF.test(f) ? 'serif' : 'sans-serif'}`;
+    const subFamily = (el) => {
+      const first = (getComputedStyle(el).fontFamily || '').split(',')[0].replace(/["']/g, '').trim();
+      return fontMap[first.toLowerCase()] || null;
+    };
+    /**
+     * Width of the widest laid-out line, to sub-pixel precision. `scrollWidth` is rounded
+     * to a whole pixel, and a line two tenths of a pixel over the edge still wraps — so
+     * the rounded value reports a comfortable fit for text that visibly spills. Client
+     * rects arrive one per inline fragment, so rows are rebuilt by their top edge.
+     */
+    const widestLine = (el) => {
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      const rows = new Map();
+      for (const r of range.getClientRects()) {
+        if (r.width <= 0) continue;
+        const key = Math.round(r.top);
+        const row = rows.get(key);
+        if (row) { row.l = Math.min(row.l, r.left); row.r = Math.max(row.r, r.right); }
+        else rows.set(key, { l: r.left, r: r.right });
+      }
+      let max = 0;
+      for (const row of rows.values()) max = Math.max(max, row.r - row.l);
+      return max;
+    };
+
+    // What counts as overflow depends on whether the box can reflow.
+    //
+    // A wrapping box must fit its width exactly: a line a tenth of a pixel over the edge
+    // still wraps, and the wrapped remainder lands outside whatever panel framed it.
+    // Its height also has to fit, with a tolerance for the ascent/descent and
+    // `line-height: normal` differences between the two fonts — big enough to ignore
+    // metric noise, small enough that a genuine extra line still registers.
+    //
+    // A no-wrap box cannot gain a line at all, so sub-pixel overhang is invisible and
+    // shrinking for it would be pointless. Only a visible amount of overhang matters, and
+    // its height is meaningless here — it would just compare the stand-in font's own line
+    // box and flag single glyphs like "│" as overflowing.
+    const FITS = (probe, t) => t.nowrap
+      ? widestLine(probe) <= t.w * 1.02 + 1
+      : widestLine(probe) <= t.w && probe.scrollHeight <= t.h * 1.04 + 1;
+    // Stop at 80%: below that the text is small enough to be its own defect, and a
+    // reported overflow is more useful than silently illegible type.
+    const STEPS = [1, 0.97, 0.94, 0.91, 0.88, 0.85, 0.82, 0.8];
+
+    for (const [i, el] of textRoots.entries()) {
+      const t = texts[i];
+      t.fit = 1;
+      if (t.h < 4 || t.w < 4) continue;
+      // Nothing is being substituted in this box, so nothing can reflow.
+      if (![el, ...el.querySelectorAll('*')].some(subFamily)) continue;
+
+      const probe = el.cloneNode(true);
+      // Take the clone out of flow at exactly the geometry PowerPoint will give it.
+      // setProperty() only accepts kebab-case names — camelCase is silently ignored.
+      const box = {
+        position: 'absolute', left: '-99999px', top: '0', visibility: 'hidden',
+        width: t.w + 'px', height: 'auto', 'max-height': 'none', 'min-height': '0',
+        margin: '0', padding: '0', transform: 'none', animation: 'none',
+      };
+      // A no-wrap box overflows sideways instead of reflowing, so measure it that way.
+      if (t.nowrap) box['white-space'] = 'pre';
+      for (const p in box) probe.style.setProperty(p, box[p], 'important');
+      el.parentElement.appendChild(probe);
+      // Strip what this text box does not carry: nested box roots became their own
+      // boxes, and measuring them here would hide the owned text's own overflow.
+      // Absorbed inline-flow descendants stay — they are part of these runs.
+      for (const nested of [...probe.querySelectorAll('*')]) {
+        if (nested.isConnected && isBox(nested) && !absorbed(nested)) nested.remove();
+      }
+
+      // Snapshot the authored metrics before rewriting families, then scale from them.
+      const nodes = [probe, ...probe.querySelectorAll('*')];
+      const base = nodes.map((n) => {
+        const cs = getComputedStyle(n);
+        return {
+          size: parseFloat(cs.fontSize) || 0,
+          // Only fixed line-heights and letter-spacings need scaling by hand;
+          // unitless/`normal` values already track the font size.
+          line: cs.lineHeight === 'normal' ? null : parseFloat(cs.lineHeight) || null,
+          spacing: cs.letterSpacing === 'normal' ? null : parseFloat(cs.letterSpacing) || null,
+        };
+      });
+      for (const n of nodes) {
+        const to = subFamily(n);
+        if (to) n.style.setProperty('font-family', stack(to), 'important');
+      }
+
+      for (const s of STEPS) {
+        t.fit = s;
+        nodes.forEach((n, k) => {
+          const b = base[k];
+          if (b.size) n.style.setProperty('font-size', b.size * s + 'px', 'important');
+          if (b.line) n.style.setProperty('line-height', b.line * s + 'px', 'important');
+          if (b.spacing) n.style.setProperty('letter-spacing', b.spacing * s + 'px', 'important');
+        });
+        t.fitted = FITS(probe, t);
+        if (t.fitted) break;
+      }
+      probe.remove();
+    }
   }
 
   /* ── Hyperlinks ─────────────────────────────────────────── */
@@ -432,8 +706,14 @@ function toggleTextVisibility(args) {
   const slide = document.querySelectorAll(selector)[index];
   if (!slide) return 0;
 
-  const INLINE_ONLY = new Set(['inline', 'contents', 'ruby', 'ruby-text', 'ruby-base']);
-  const isBox = (el) => !INLINE_ONLY.has(getComputedStyle(el).display);
+  // Anything laid out in its parent's inline flow belongs to the parent's text box.
+  // inline-block included: a mid-sentence badge is positioned by the surrounding text,
+  // so lifting it into its own box makes the parent's words flow through where it sits
+  // and the two collide. (A flex/grid child is blockified to `block`, so real flex items
+  // still get their own box, which is right — flex positions them independently.)
+  const INLINE_FLOW = new Set(['inline', 'inline-block', 'inline-flex', 'inline-grid',
+    'inline-table', 'contents', 'ruby', 'ruby-text', 'ruby-base']);
+  const isBox = (el) => !INLINE_FLOW.has(getComputedStyle(el).display);
   const ownsText = (el) => {
     for (const c of el.childNodes) {
       if (c.nodeType === Node.TEXT_NODE && c.nodeValue.trim()) return true;
@@ -529,6 +809,9 @@ try {
     // Extract with everything visible, so measurements reflect the real layout.
     const data = await page.evaluate(extractSlide, {
       selector: opts.selector, index: i, wantNotes: opts.notes, wantLinks: opts.links,
+      // Only editable mode paints visible text, so only it can visibly overflow.
+      wantFit: opts.mode === 'editable' && opts.shrink,
+      fontMap: FONT_MAP,
     });
 
     // In editable mode, pull image bytes before hiding anything.
@@ -586,29 +869,6 @@ function round4(n) { return Math.round(n * 10000) / 10000; }
 const inch = (px) => round4(px * PX_TO_IN);
 const pt = (px) => Math.max(1, Math.round(px * PX_TO_PT * 10) / 10);
 
-// Webfonts do not exist on the viewer's machine. Map them to fonts that ship with
-// Office on both macOS and Windows so substitution is predictable, not arbitrary.
-const DEFAULT_FONT_MAP = {
-  'clash display': 'Impact', 'satoshi': 'Verdana', 'space grotesk': 'Verdana',
-  'general sans': 'Verdana', 'cabinet grotesk': 'Trebuchet MS', 'switzer': 'Verdana',
-  'chillax': 'Trebuchet MS', 'zodiak': 'Georgia', 'sentient': 'Georgia',
-  'gambetta': 'Georgia', 'bespoke serif': 'Georgia', 'playfair display': 'Georgia',
-  'dm serif display': 'Georgia', 'libre baskerville': 'Georgia', 'lora': 'Georgia',
-  'inter': 'Arial', 'roboto': 'Arial', 'poppins': 'Trebuchet MS',
-  'montserrat': 'Trebuchet MS', 'archivo': 'Arial', 'oswald': 'Impact',
-  'bebas neue': 'Impact', 'anton': 'Impact', 'jetbrains mono': 'Consolas',
-  'ibm plex mono': 'Consolas', 'space mono': 'Consolas', 'fira code': 'Consolas',
-  'courier prime': 'Courier New',
-};
-const substitutions = new Map();
-function mapFont(name) {
-  if (!name) return 'Arial';
-  const key = name.toLowerCase();
-  const mapped = opts.fontMap[key] || DEFAULT_FONT_MAP[key];
-  if (mapped) { substitutions.set(name, mapped); return mapped; }
-  return name; // already an Office-safe or locally installed family
-}
-
 const pptx = new PptxGenJS();
 pptx.defineLayout({ name: 'FS_WIDESCREEN', width: SLIDE_W_IN, height: SLIDE_H_IN });
 pptx.layout = 'FS_WIDESCREEN';
@@ -617,7 +877,8 @@ if (opts.meta.author) pptx.author = opts.meta.author;
 if (opts.meta.company) pptx.company = opts.meta.company;
 if (opts.meta.subject) pptx.subject = opts.meta.subject;
 
-let textBoxCount = 0, linkCount = 0, notesCount = 0, nativeImageCount = 0;
+let textBoxCount = 0, linkCount = 0, notesCount = 0, nativeImageCount = 0, shrunkBoxes = 0;
+const overflowing = [];
 
 for (const [i, s] of slidesData.entries()) {
   const slide = pptx.addSlide();
@@ -651,28 +912,50 @@ for (const [i, s] of slidesData.entries()) {
   if (opts.mode !== 'image') {
     const invisible = opts.mode === 'searchable';
     for (const t of s.texts) {
-      const runs = [];
+      // The measured scale that keeps the substituted font inside the authored box.
+      const fit = t.fit && t.fit < 1 ? t.fit : 1;
+      if (fit < 1) shrunkBoxes++;
+      // Shrinking bottomed out and the text still does not fit. Naming it is more use
+      // than shrinking further, which only trades overflow for unreadable type.
+      if (t.fitted === false) overflowing.push({ slide: i + 1, text: t.plain.slice(0, 60) });
+
+      // Group runs into lines first. Setting `breakLine` on "the previous run" as the
+      // markers arrive loses blank lines (two breaks in a row would collapse), so lines
+      // are materialised and the break is put on each line's last run explicitly.
+      const lines = [[]];
       for (const r of t.runs) {
-        if (r.break) {
-          if (runs.length) runs[runs.length - 1].options.breakLine = true;
-          continue;
-        }
-        const st = r.style;
-        runs.push({
-          text: r.text,
-          options: {
-            fontFace: mapFont(st.font),
-            fontSize: pt(st.sizePx),
-            bold: st.bold,
-            italic: st.italic,
-            underline: st.underline ? { style: 'sng' } : undefined,
-            color: st.color,
-            // Alpha and invisibility both ride on the same transparency channel.
-            transparency: invisible ? 100 : (st.alpha < 1 ? Math.round((1 - st.alpha) * 100) : undefined),
-            charSpacing: st.letterSpacingPx ? round4(st.letterSpacingPx * PX_TO_PT) : undefined,
-          },
-        });
+        if (r.break) lines.push([]);
+        else lines[lines.length - 1].push(r);
       }
+
+      const runs = [];
+      lines.forEach((line, li) => {
+        const notLast = li < lines.length - 1;
+        if (!line.length) {
+          // An empty line still needs a run to carry the paragraph, or the blank
+          // line vanishes and the following text moves up.
+          runs.push({ text: '', options: { breakLine: notLast, fontSize: pt(12) } });
+          return;
+        }
+        line.forEach((r, ri) => {
+          const st = r.style;
+          runs.push({
+            text: r.text,
+            options: {
+              fontFace: mapFont(st.font),
+              fontSize: pt(st.sizePx * fit),
+              bold: st.bold,
+              italic: st.italic,
+              underline: st.underline ? { style: 'sng' } : undefined,
+              color: st.color,
+              // Alpha and invisibility both ride on the same transparency channel.
+              transparency: invisible ? 100 : (st.alpha < 1 ? Math.round((1 - st.alpha) * 100) : undefined),
+              charSpacing: st.letterSpacingPx ? round4(st.letterSpacingPx * fit * PX_TO_PT) : undefined,
+              breakLine: notLast && ri === line.length - 1,
+            },
+          });
+        });
+      });
       if (!runs.length) continue;
 
       slide.addText(runs, {
@@ -680,9 +963,9 @@ for (const [i, s] of slidesData.entries()) {
         align: t.align === 'justify' ? 'justify' : t.align,
         valign: 'top',
         margin: 0,          // PowerPoint's default inset would shift every box
-        wrap: true,
-        autoFit: false,     // keep the authored size; never silently rescale text
-        lineSpacing: t.lineHeightPx ? round4(t.lineHeightPx * PX_TO_PT) : undefined,
+        wrap: !t.nowrap,    // single-line text must not reflow on a different renderer
+        autoFit: false,     // keep the measured size; never let PowerPoint rescale silently
+        lineSpacing: t.lineHeightPx ? round4(t.lineHeightPx * fit * PX_TO_PT) : undefined,
       });
       textBoxCount++;
     }
@@ -707,7 +990,7 @@ await pptx.writeFile({ fileName: OUTPUT });
 /* ═══════════════════════════════════════════════════════════
    SCHEMA REPAIR
    pptxgenjs 4.x emits two constructs that ECMA-376 forbids. PowerPoint is
-   lenient about both, but strict validators, Google Slides and LibreOffice
+   lenient about both, but strict validators, Keynote and Google Slides
    are not — so fix them in the written package.
 
    1. CT_Presentation fixes child order as sldMasterIdLst -> notesMasterIdLst
@@ -772,6 +1055,8 @@ const summary = {
   stage: { width: stage.width, height: stage.height },
   slideSizeInches: { w: SLIDE_W_IN, h: SLIDE_H_IN },
   textBoxes: textBoxCount,
+  shrunkTextBoxes: shrunkBoxes,
+  overflowingTextBoxes: overflowing,
   hyperlinks: linkCount,
   notes: notesCount,
   nativeImages: nativeImageCount,
@@ -788,6 +1073,12 @@ if (opts.json) {
   console.log(`✓ ${OUTPUT}`);
   console.log(`  ${summary.slides} slides · ${sizeMB} MB · ${SLIDE_W_IN}×${SLIDE_H_IN}in`);
   if (textBoxCount) console.log(`  ${textBoxCount} text boxes${opts.mode === 'searchable' ? ' (invisible search layer)' : ''}`);
+  if (shrunkBoxes) console.log(`  ${shrunkBoxes} of them shrunk to fit the substituted font (--no-shrink to keep authored sizes)`);
+  if (overflowing.length) {
+    console.log(`  ⚠ ${overflowing.length} still overflow at the ${Math.round(0.8 * 100)}% floor — check these:`);
+    for (const o of overflowing.slice(0, 8)) console.log(`      slide ${o.slide}: ${JSON.stringify(o.text)}`);
+    if (overflowing.length > 8) console.log(`      … and ${overflowing.length - 8} more`);
+  }
   if (nativeImageCount) console.log(`  ${nativeImageCount} native images`);
   if (linkCount) console.log(`  ${linkCount} hyperlinks`);
   if (notesCount) console.log(`  ${notesCount} slides with speaker notes`);

@@ -5,16 +5,17 @@ description: Convert an HTML presentation (built with the frontend-slides skill,
 
 # Slides → PowerPoint
 
-Turn a frontend-slides HTML deck into a `.pptx` that opens correctly in PowerPoint, Keynote,
-Google Slides and LibreOffice — and prove it opens correctly before handing it over.
+Turn a frontend-slides HTML deck into a `.pptx` that opens correctly in PowerPoint, Keynote and
+Google Slides — and prove it is right before handing it over.
 
 ## Core Principles
 
 1. **Fidelity is the default, editability is a request.** A frontend-slides deck is a designed
    artifact: custom webfonts, gradients, CSS art. Reproducing it pixel-perfect is the honest
    default. Rebuilding it as native shapes is what you do when someone must *edit* it.
-2. **Never hand over an unvalidated file.** A `.pptx` that opens on your machine can still be
-   schema-invalid and break in Google Slides. Always run the validator.
+2. **Never hand over an unverified file.** Two different questions, two different checks: the
+   validator proves the package is well-formed, the inspector proves the content landed where it
+   belongs. A deck can pass the first and be unusable. Run both — the wrapper does by default.
 3. **Say what was lost.** Every conversion drops something — animations always, fonts usually,
    editability sometimes. Name the losses explicitly instead of letting the user discover them
    in front of an audience.
@@ -62,7 +63,7 @@ environment's structured-question UI if available, otherwise ask concisely.
 | ------ | ------------- | --------- |
 | **Presenting as-is** (`image`) | Every slide is one full-bleed picture. Pixel-perfect: exact fonts, gradients, CSS art. Nothing is editable. | Default. They will present from PowerPoint or just need a `.pptx` to send. |
 | **Searchable & accessible** (`searchable`) | Same pixel-perfect picture, plus an invisible native text layer. Text is searchable, copy-pasteable and readable by screen readers. Still not visually editable. | Corporate/compliance sharing, accessibility requirements, decks that get searched. |
-| **Editable in PowerPoint** (`editable`) | Background artwork is captured with the text hidden, then every text block is rebuilt as a real PowerPoint text box. Fully editable. Webfonts get substituted. | Someone else must change the words, translate it, or reuse slides. |
+| **Editable in PowerPoint** (`editable`) | Background artwork is captured with the text hidden, then every text block is rebuilt as a real PowerPoint text box. Fully editable. Webfonts get substituted, and text the stand-in font would push out of its box is shrunk to fit. | Someone else must change the words, translate it, or reuse slides. |
 
 Read [reference/conversion-modes.md](reference/conversion-modes.md) before recommending a mode
 if you need the detailed trade-offs.
@@ -107,7 +108,9 @@ bash scripts/slides-to-pptx.sh ./deck.html --jpeg 85 --scale 1
 | `--selector <css>` | If the deck does not use `.slide` |
 | `--keep-chrome` | Keep nav arrows / page counters / edit UI in the artwork (normally hidden) |
 | `--no-notes`, `--no-links` | Skip speaker notes / hyperlink hotspots |
-| `--render-check` | Also round-trip through LibreOffice, if installed |
+| `--preview <dir>` | Render each emitted slide back to a PNG for visual verification |
+| `--no-shrink` | `editable` only: keep authored font sizes even where the substituted font overflows |
+| `--no-inspect` | Skip the layout inspection pass |
 
 ### File size expectations
 
@@ -147,39 +150,68 @@ failures. Warnings (`⚠`) are worth reading aloud to the user but are not block
 
 ---
 
-## Phase 4: Verify Visually (Required)
+## Phase 4: Inspect the Layout (Required)
 
-Validation proves the file is *well-formed*. It does not prove it *looks right*. Do this too:
+Validation proves the file is *well-formed*. It does not prove it *looks right*. The wrapper runs
+`inspect-pptx.mjs` next, which reads the geometry back out of the written package and lints it:
 
-1. **Check the captured artwork.** Re-run with `--keep-shots ./shots` and look at 2-3 slides —
-   the title slide, a dense content slide, and any slide with images. Confirm:
-   - Webfonts rendered (not a fallback), gradients and CSS art present
-   - Reveal animations landed in their final state, not mid-fade
-   - No nav chrome or page counters baked into the artwork
-   - Images actually appear
-2. **In `editable` mode, also check text placement.** The background capture should show the
-   design with all words removed. If words are still visible in the background, they will be
-   double-rendered under the native text boxes — report it rather than shipping it.
-3. **If LibreOffice is installed**, `--render-check` proves a real renderer opens the file and
-   produces the expected page count.
+```
+  ⚠ slide 16 [overlap] two text boxes overlap by 100% — "For Java, over-approximates" / "CHA"
+  ⚠ slide 8 [off-slide] text box runs 0.4in past the right edge: "…"
+  ⚠ slide 1 [tiny-font] 7.2pt text (below 8pt): "Denis Bueno · Arlen Cox"
+```
+
+**These findings are usually real.** The HTML laid the deck out with nothing overlapping, so an
+overlap in the output means something reflowed. See
+[reference/inspection.md](reference/inspection.md) for how to read each one.
+
+No office suite is involved and none is needed. Do not add one to check a deck — that file
+explains why, and the preview below is the better check.
+
+### Look at it
+
+Add `--preview ./preview` and open 2-3 of the PNGs — the title slide, the densest content slide,
+and any slide the lint flagged. Each is the emitted `.pptx` rebuilt from its own coordinates, so
+what you see is what was written. Confirm:
+
+- Text sits where the design put it; nothing collides or spills out of a panel
+- Gradients, CSS art and any images are present in the background artwork
+- Reveal animations landed in their final state, not mid-fade
+- No nav chrome or page counters baked in
+
+To compare against the source instead, `--keep-shots ./shots` writes the captured artwork at the
+same 1920px width, so the two sets line up 1:1.
+
+In `editable` mode the artwork should show the design with **all words removed**. If words are
+still visible there, they will be double-rendered under the native text boxes — report it rather
+than shipping it.
 
 ### Font substitution (editable mode)
 
-`editable` mode reports every substitution it made:
+`editable` mode reports every substitution it made, and how many boxes it had to shrink:
 
 ```
+  334 text boxes
+  31 of them shrunk to fit the substituted font (--no-shrink to keep authored sizes)
+  ⚠ 2 still overflow at the 80% floor — check these:
+      slide 18: "MODELS"
 font substitutions (webfonts are not installed on viewers' machines):
-  Clash Display → Impact
-  Satoshi → Verdana
+  JetBrains Mono → Consolas
+  Space Grotesk → Arial
 ```
 
-This is the biggest fidelity loss in editable mode and **you must tell the user about it**.
-Three ways to handle it, in order of quality — see
-[reference/font-mapping.md](reference/font-mapping.md):
+Substitution is the biggest fidelity loss in editable mode and **you must tell the user about
+it**. Stand-in fonts have different metrics, so text that fitted its box in the browser reflows;
+the converter measures each box again with the substitute applied and steps the font size down
+until it fits, stopping at 80% and naming whatever still does not fit. Fixes, in order of
+quality — see [reference/font-mapping.md](reference/font-mapping.md):
 
 1. The recipient installs the actual webfonts (best fidelity, needs their cooperation)
-2. Override the mapping with `--font-map "Clash Display=Oswald"` to a font they do have
-3. Accept the default mapping (always works, always looks different from the HTML)
+2. Override the mapping with `--font-map "Clash Display=Oswald"` to a narrower font they have
+3. Accept the defaults — always works, always looks different from the HTML
+
+Note the measurement uses the fonts available on *this* machine. Office fonts like Consolas are
+often absent, so it measures a same-class stand-in and lands close rather than exact.
 
 ---
 
@@ -190,7 +222,8 @@ Tell the user:
 - **File location and size**
 - **Which mode** and, in one sentence, what that means for them
 - **What was lost.** Always: animations and transitions become their final static frame.
-  In `image`/`searchable`: text is not visually editable. In `editable`: fonts were substituted.
+  In `image`/`searchable`: text is not visually editable. In `editable`: fonts were substituted,
+  and say how many boxes were shrunk to keep the substitute inside its box.
 - **Speaker notes carried over**, if any — they live in PowerPoint's notes pane
 - **Hyperlinks still work** (they are invisible clickable hotspots over the artwork)
 
@@ -209,7 +242,10 @@ instead via the frontend-slides skill.
 | Blank or near-blank slides | Slide never became visible | Deck uses a nonstandard show mechanism — check it toggles `.active`/`.visible` |
 | Images missing | Absolute filesystem paths in `src` | Make paths relative to the HTML file |
 | File is enormous | PNG at scale 2 | `--jpeg 85 --scale 1` |
-| Text overflows its box in editable mode | Substituted font is wider than the original | `--font-map` to a narrower font, or use `searchable` mode |
+| Text overflows its box in editable mode | Substituted font is wider than the original and the shrink pass bottomed out at 80% | `--font-map` to a narrower font, or use `searchable` mode |
+| Editable text looks slightly small | The shrink pass fitted it to the substituted font | Expected; `--no-shrink` restores authored sizes and accepts the overflow |
+| `overlap` findings on a flex/grid-heavy deck | A container's border box spans its children | The converter uses the glyphs' own rect here; confirm against `--preview` before reporting |
+| Words glued together, or `<pre>` lines merged | An old build — whitespace-only text nodes were being dropped | Fixed; re-run with the current scripts |
 | `schema: ... unexpected child element` | A pptxgenjs output bug | The converter auto-repairs the two known ones; report anything else |
 
 ---
@@ -227,7 +263,17 @@ Worth knowing when something goes wrong:
 4. Positioned elements **outside** the slide stage (nav, counters, edit UI) are hidden.
 5. Each slide is captured, then emitted at PowerPoint's canonical widescreen size.
    **1 authored px = 0.5 pt = 6350 EMU** at a 1920px stage, so positions and font sizes are exact.
-6. Two known pptxgenjs schema bugs are repaired in the written package (see
+6. Text boxes are cut from the DOM by inline flow, not by element: anything laid out inside its
+   parent's line — `inline`, and `inline-block`/`inline-flex` chips and badges too — is absorbed
+   into that parent's box, subtree and all. Lifting a mid-sentence badge into a box of its own
+   would make the parent's words flow through the space it occupies and land on top of it.
+7. A box is positioned by its element's content box, except where that box is shared with text
+   that became a box of its own — a flex or grid row — in which case the glyphs' own rect is
+   used. Text the browser laid out on one line is emitted `wrap="none"` so no renderer can
+   reflow it.
+8. In `editable` mode each box is measured a second time with its substituted font applied, in
+   an off-screen clone, and the font size stepped down until it fits (floor 80%).
+9. Two known pptxgenjs schema bugs are repaired in the written package (see
    [reference/validation.md](reference/validation.md)).
 
 ---
@@ -238,7 +284,9 @@ Worth knowing when something goes wrong:
 | ---- | ------- | ------------ |
 | [reference/conversion-modes.md](reference/conversion-modes.md) | What survives each mode, in detail | Phase 1, when advising on mode |
 | [reference/font-mapping.md](reference/font-mapping.md) | Webfont → Office font table and strategy | Phase 4, editable mode |
+| [reference/inspection.md](reference/inspection.md) | Geometry report, preview render, and how to read each lint finding | Phase 4, always |
 | [reference/validation.md](reference/validation.md) | Every check, what it catches, how to fix | Phase 3, on any failure |
-| [scripts/slides-to-pptx.sh](scripts/slides-to-pptx.sh) | Wrapper: deps → convert → validate | Phase 2 |
+| [scripts/slides-to-pptx.sh](scripts/slides-to-pptx.sh) | Wrapper: deps → convert → validate → inspect | Phase 2 |
 | [scripts/html2pptx.mjs](scripts/html2pptx.mjs) | The converter | Direct/scripted use |
-| [scripts/validate-pptx.mjs](scripts/validate-pptx.mjs) | The validator | Phase 3 |
+| [scripts/validate-pptx.mjs](scripts/validate-pptx.mjs) | The validator: package, geometry, schema | Phase 3 |
+| [scripts/inspect-pptx.mjs](scripts/inspect-pptx.mjs) | The inspector: layout lint + preview render | Phase 4 |

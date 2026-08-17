@@ -1,7 +1,7 @@
 # Validation
 
 ```bash
-node scripts/validate-pptx.mjs deck.pptx [--expect-slides N] [--expect-text] [--no-schema] [--render-check] [--json]
+node scripts/validate-pptx.mjs deck.pptx [--expect-slides N] [--expect-text] [--no-schema] [--json]
 ```
 
 Exit code `0` = pass, `1` = problems found, `2` = bad usage or unreadable file.
@@ -10,7 +10,7 @@ Exit code `0` = pass, `1` = problems found, `2` = bad usage or unreadable file.
 ## Why validate at all
 
 A `.pptx` is a zip of XML parts bound by relationship files. It is easy to produce one that
-PowerPoint opens (PowerPoint is famously lenient) but that Google Slides, Keynote or LibreOffice
+PowerPoint opens (PowerPoint is famously lenient) but that Google Slides or Keynote
 reject or render wrong. Two of the three schema bugs this validator catches are produced by
 **pptxgenjs itself**, on every file it writes.
 
@@ -65,12 +65,12 @@ Needs `npx` and one-time network access to fetch the package. If unavailable, th
 skipped with a warning rather than failing; `--no-schema` silences it. The duplicate-`<a:pPr>`
 bug is *also* checked directly in pure JS, so it is caught even offline.
 
-### 6. Render round-trip (`--render-check`)
+## What this does *not* check
 
-Converts the deck to PDF with headless LibreOffice and compares the page count to the slide
-count. This is the strongest available proof that a real, independent renderer opens the file.
-
-Requires LibreOffice (`brew install --cask libreoffice`). Skipped with a warning if absent.
+Validation proves the package is well-formed. It says nothing about whether the content landed
+where it should — text can be schema-perfect and still sit off the slide or on top of its
+neighbour. That is [inspection](inspection.md)'s job, and the wrapper runs it straight after
+this.
 
 ## Known pptxgenjs bugs, repaired automatically
 
@@ -115,7 +115,6 @@ paragraph's formatting is unchanged.
 | `slide N: references missing media` | Broken relationship | Re-run the conversion |
 | `multiple <a:pPr>` | The pptxgenjs bug above | Should be auto-repaired; report if it survives |
 | `schema: …` | Any other ECMA-376 violation | Not a known bug — report the exact message |
-| `render check: LibreOffice produced no PDF` | A real renderer cannot open it | Serious; do not ship the file |
 
 ## Warnings worth mentioning to the user
 
