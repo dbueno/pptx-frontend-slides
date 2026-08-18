@@ -13,7 +13,8 @@
  *   --json                 Emit machine-readable results
  *
  * Checks, in order of how much they actually catch:
- *   1. Package structure   — zip integrity, required parts, relationship targets resolve
+ *   1. Package structure   — zip integrity, required parts, relationship targets resolve,
+ *                            and PowerPoint-repair-prone notes/theme wiring is absent
  *   2. Deck geometry       — slide size in EMU, 16:9 aspect, canonical widescreen match
  *   3. Slide inventory     — slide parts vs sldIdLst, media per slide, notes, text runs
  *   4. Blank-art heuristic — flags slide images small enough to be a flat blank frame
@@ -25,7 +26,7 @@
 import { readFile } from 'fs/promises';
 import { existsSync } from 'fs';
 import { execFileSync } from 'child_process';
-import { resolve, join } from 'path';
+import { resolve, join, posix as posixPath } from 'path';
 import { createRequire } from 'module';
 
 // See html2pptx.mjs — SLIDES_PPTX_DEPS points at the shared dependency cache.
@@ -90,12 +91,75 @@ const relIds = new Set([...presRels.matchAll(/Id="([^"]+)"/g)].map((m) => m[1]))
 for (const m of presXml.matchAll(/r:id="([^"]+)"/g)) {
   if (!relIds.has(m[1])) fail(`presentation.xml references undeclared relationship ${m[1]}`);
 }
-// Relationship targets must exist in the package.
+// Presentation relationship targets must exist in the package.
 for (const m of presRels.matchAll(/Target="([^"]+)"[^>]*?(TargetMode="External")?\/>/g)) {
   if (m[2]) continue;
   const target = m[1].replace(/^\.\.\//, '').replace(/^\//, '');
   const full = target.startsWith('ppt/') ? target : `ppt/${target}`;
   if (!names.includes(full)) fail(`Relationship target missing from package: ${full}`);
+}
+
+// Every internal relationship in the package should resolve, not just the ones
+// from presentation.xml. Also catch the PowerPoint repair seen in Office: notes
+// masters that share the slide/presentation theme part and blank notes text runs.
+const relRecords = [];
+const attr = (tag, name) => tag.match(new RegExp(`\\b${name}="([^"]*)"`))?.[1] || '';
+const relSourceDir = (relName) => {
+  if (relName === '_rels/.rels') return '';
+  const marker = '/_rels/';
+  const idx = relName.indexOf(marker);
+  return idx === -1 ? posixPath.dirname(relName) : relName.slice(0, idx);
+};
+const normalizeTarget = (relName, target) => {
+  if (/^[a-z][a-z0-9+.-]*:/i.test(target)) return target;
+  return posixPath.normalize(posixPath.join(relSourceDir(relName), target)).replace(/^\.\//, '');
+};
+
+for (const relName of names.filter((n) => n.endsWith('.rels'))) {
+  const relXml = (await read(relName)) || '';
+  const ids = new Set();
+  for (const m of relXml.matchAll(/<Relationship\b[^>]*\/>/g)) {
+    const tag = m[0];
+    const id = attr(tag, 'Id');
+    const type = attr(tag, 'Type');
+    const target = attr(tag, 'Target');
+    const mode = attr(tag, 'TargetMode');
+    if (id) {
+      if (ids.has(id)) fail(`${relName} declares duplicate relationship id ${id}`);
+      ids.add(id);
+    }
+    if (!target || mode === 'External') continue;
+    const full = normalizeTarget(relName, target);
+    relRecords.push({ relName, id, type, target, full });
+    if (!names.includes(full)) fail(`${relName} targets missing package part: ${full}`);
+  }
+}
+
+const contentTypesXml = (await read('[Content_Types].xml')) || '';
+const hasContentTypeOverride = (partName, contentType) => new RegExp(`<Override\\s+PartName="/${partName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"\\s+ContentType="${contentType.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"\\s*/>`).test(contentTypesXml);
+const THEME_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.theme+xml';
+for (const themePart of names.filter((n) => /^ppt\/theme\/theme\d+\.xml$/.test(n))) {
+  if (!hasContentTypeOverride(themePart, THEME_CONTENT_TYPE)) {
+    fail(`${themePart} is missing its theme content-type override`);
+  }
+}
+
+const sharedThemeOwners = new Set(
+  relRecords
+    .filter((r) => r.type.endsWith('/theme') && (r.relName === 'ppt/_rels/presentation.xml.rels' || r.relName.startsWith('ppt/slideMasters/_rels/')))
+    .map((r) => r.full)
+);
+for (const r of relRecords.filter((rec) => rec.type.endsWith('/theme') && rec.relName.startsWith('ppt/notesMasters/_rels/'))) {
+  if (sharedThemeOwners.has(r.full)) {
+    fail(`${r.relName} shares theme part ${r.full} with the presentation/slide master; PowerPoint repairs this by adding a dedicated notes theme`);
+  }
+}
+
+const EMPTY_NOTES_RUN = /<a:r>\s*<a:rPr(?:\s[^>]*)?\/>\s*<a:t(?:\s*\/|><\/a:t>)\s*<\/a:r>/;
+for (const notesPart of names.filter((n) => /^ppt\/notesSlides\/notesSlide\d+\.xml$/.test(n))) {
+  if (EMPTY_NOTES_RUN.test((await read(notesPart)) || '')) {
+    fail(`${notesPart} contains an empty notes text run that PowerPoint removes during repair`);
+  }
 }
 
 /* ── 2. Deck geometry ───────────────────────────────────── */

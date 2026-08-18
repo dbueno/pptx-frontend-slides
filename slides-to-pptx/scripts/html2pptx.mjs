@@ -11,6 +11,7 @@
  *   --scale <n>                          Screenshot device pixel ratio (default: 2)
  *   --jpeg [quality]                     Encode slide art as JPEG (default: PNG)
  *   --native-images                      editable mode: lift <img> out as real pictures
+ *   --no-background-art                  editable mode: omit full-slide screenshot artwork
  *   --keep-chrome                        Do not hide nav/counter/edit UI outside the stage
  *   --font-map "A=B,C=D"                 Substitute webfont A with Office font B
  *   --no-notes                           Skip speaker notes
@@ -29,7 +30,7 @@
  *
  * The pipeline: serve the deck over HTTP -> drive it in headless Chromium -> capture each
  * slide at the deck's own authored stage size -> emit a .pptx at PowerPoint's canonical
- * 13.3333333 x 7.5in widescreen size -> repair pptxgenjs's element-order schema bug.
+ * 13.3333333 x 7.5in widescreen size -> repair pptxgenjs's OOXML/PowerPoint quirks.
  */
 
 import { createServer } from 'http';
@@ -79,6 +80,7 @@ const opts = {
   jpeg: false,
   jpegQuality: 88,
   nativeImages: false,
+  backgroundArt: true,
   keepChrome: false,
   fontMap: {},
   notes: true,
@@ -103,6 +105,7 @@ for (let i = 0; i < argv.length; i++) {
       if (argv[i + 1] && /^\d+$/.test(argv[i + 1])) opts.jpegQuality = Number(next());
       break;
     case '--native-images': opts.nativeImages = true; break;
+    case '--no-background-art': opts.backgroundArt = false; break;
     case '--keep-chrome': opts.keepChrome = true; break;
     case '--font-map':
       for (const pair of next().split(',')) {
@@ -130,6 +133,9 @@ if (!positional.length) {
 }
 if (!['image', 'searchable', 'editable'].includes(opts.mode)) {
   fail(`--mode must be image, searchable, or editable (got "${opts.mode}")`);
+}
+if (!opts.backgroundArt && opts.mode !== 'editable') {
+  fail('--no-background-art is only supported with --mode editable');
 }
 
 const INPUT = resolve(positional[0]);
@@ -317,6 +323,7 @@ function extractSlide(args) {
     const r = el.getBoundingClientRect();
     return r.width > 0.5 && r.height > 0.5;
   };
+  const isRasterized = (el) => el.closest('[data-pptx-raster], [data-pptx-screenshot]');
 
   // An element is a "text box root" when it is not laid out in its parent's inline flow
   // and owns text that isn't claimed by a nested box root.
@@ -476,9 +483,36 @@ function extractSlide(args) {
   /* ── Text boxes ─────────────────────────────────────────── */
   const texts = [];
   const textRoots = [];
+  const processedListItems = new WeakSet();
+  const listItemDepth = (li) => {
+    let depth = 0;
+    for (let p = li.parentElement; p && p !== slide; p = p.parentElement) {
+      if (p.tagName === 'UL' || p.tagName === 'OL') depth++;
+    }
+    return Math.max(depth, 1);
+  };
   for (const el of slide.querySelectorAll('*')) {
+    if (isRasterized(el)) continue;
     if (!isBox(el) || absorbed(el) || !isVisible(el)) continue;
-    const runs = collectRuns(el);
+    const isList = el.tagName === 'UL' || el.tagName === 'OL';
+    const listItems = isList
+      ? [...el.children].filter((child) => child.tagName === 'LI' && isVisible(child))
+      : [];
+    if (el.tagName === 'LI' && processedListItems.has(el)) continue;
+
+    let runs;
+    if (isList && listItems.length) {
+      runs = [];
+      listItems.forEach((li, idx) => {
+        const liRuns = collectRuns(li);
+        if (!liRuns.some((r) => r.text && r.text.trim())) return;
+        if (runs.length && idx > 0) runs.push({ break: true });
+        runs.push(...liRuns);
+        processedListItems.add(li);
+      });
+    } else {
+      runs = collectRuns(el);
+    }
     if (!runs.some((r) => r.text && r.text.trim())) continue;
 
     const cs = getComputedStyle(el);
@@ -521,9 +555,14 @@ function extractSlide(args) {
     }
 
     textRoots.push(el);
+    const listDepth = isList ? 1 : (el.tagName === 'LI' ? listItemDepth(el) : 0);
+    const listType = isList ? (el.tagName === 'OL' ? 'number' : 'bullet')
+      : (el.tagName === 'LI' ? (el.parentElement?.tagName === 'OL' ? 'number' : 'bullet') : null);
     texts.push({
       x, y, w, h, nowrap,
       align,
+      listDepth,
+      listType,
       lineHeightPx: lh,
       runs: runs.map((r) => (r.break ? { break: true } : { text: r.text, style: r.style })),
       plain: runs.map((r) => (r.break ? '\n' : r.text)).join('').trim(),
@@ -670,6 +709,20 @@ function extractSlide(args) {
     images.push({ ...r, src: img.src, alt: img.alt || '', fit: cs.objectFit || 'fill' });
   }
 
+  /* ── Raster regions (editable mode) ───────────────────────
+     Mark complex HTML/CSS figures with data-pptx-raster when they should remain as
+     cropped slide artwork instead of becoming fragile native text/shapes. */
+  const rasters = [];
+  let rasterIndex = 0;
+  for (const el of slide.querySelectorAll('[data-pptx-raster], [data-pptx-screenshot]')) {
+    if (!isVisible(el)) continue;
+    const r = norm(el.getBoundingClientRect());
+    if (r.w < 1 || r.h < 1) continue;
+    const id = `${index}-${rasterIndex++}`;
+    el.setAttribute('data-slides-pptx-raster-id', id);
+    rasters.push({ ...r, id, alt: (el.getAttribute('aria-label') || el.textContent || 'Figure').replace(/\s+/g, ' ').trim().slice(0, 300) });
+  }
+
   /* ── Speaker notes ──────────────────────────────────────── */
   let notes = '';
   if (wantNotes) {
@@ -693,7 +746,7 @@ function extractSlide(args) {
   const heading = slide.querySelector('h1, h2, h3, .slide-title, [class*="title"]');
   const title = (heading?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
 
-  return { texts, links, images, notes, title, allText: texts.map((t) => t.plain).filter(Boolean).join(' · ') };
+  return { texts, links, images, rasters, notes, title, allText: texts.map((t) => t.plain).filter(Boolean).join(' · ') };
 }
 
 /**
@@ -715,6 +768,7 @@ function toggleTextVisibility(args) {
   const INLINE_FLOW = new Set(['inline', 'inline-block', 'inline-flex', 'inline-grid',
     'inline-table', 'contents', 'ruby', 'ruby-text', 'ruby-base']);
   const isBox = (el) => !INLINE_FLOW.has(getComputedStyle(el).display);
+  const isRasterized = (el) => el.closest('[data-pptx-raster], [data-pptx-screenshot]');
   const ownsText = (el) => {
     for (const c of el.childNodes) {
       if (c.nodeType === Node.TEXT_NODE && c.nodeValue.trim()) return true;
@@ -729,7 +783,8 @@ function toggleTextVisibility(args) {
   const STYLE_PROPS = ['-webkit-text-fill-color', 'text-shadow'];
   const MEDIA = new Set(['IMG', 'SVG', 'VIDEO', 'CANVAS', 'PICTURE', 'SOURCE']);
   const maskGlyphs = (root) => {
-    const targets = [root, ...root.querySelectorAll('*')].filter((node) => !MEDIA.has(node.tagName));
+    const targets = [root, ...root.querySelectorAll('*')]
+      .filter((node) => !MEDIA.has(node.tagName) && !isRasterized(node));
     for (const node of targets) {
       if (!masked.has(node)) {
         const saved = {};
@@ -746,7 +801,8 @@ function toggleTextVisibility(args) {
     }
   };
   const restoreGlyphs = (root) => {
-    const targets = [root, ...root.querySelectorAll('*')].filter((node) => !MEDIA.has(node.tagName));
+    const targets = [root, ...root.querySelectorAll('*')]
+      .filter((node) => !MEDIA.has(node.tagName) && !isRasterized(node));
     for (const node of targets) {
       const saved = masked.get(node);
       if (!saved) continue;
@@ -758,13 +814,34 @@ function toggleTextVisibility(args) {
       masked.delete(node);
     }
   };
+  const preserveGlyphs = (root) => {
+    const targets = [root, ...root.querySelectorAll('*')].filter((node) => !MEDIA.has(node.tagName));
+    for (const node of targets) {
+      if (!masked.has(node)) {
+        const saved = {};
+        for (const prop of STYLE_PROPS) {
+          saved[prop] = {
+            value: node.style.getPropertyValue(prop),
+            priority: node.style.getPropertyPriority(prop),
+          };
+        }
+        masked.set(node, saved);
+      }
+      node.style.setProperty('-webkit-text-fill-color', 'currentColor', 'important');
+    }
+  };
 
   let n = 0;
   for (const el of slide.querySelectorAll('*')) {
+    if (isRasterized(el)) continue;
     if (!isBox(el) || !ownsText(el)) continue;
     if (hide) maskGlyphs(el);
     else restoreGlyphs(el);
     n++;
+  }
+  for (const el of slide.querySelectorAll('[data-pptx-raster], [data-pptx-screenshot]')) {
+    if (hide) preserveGlyphs(el);
+    else restoreGlyphs(el);
   }
   if (hideImages) {
     for (const img of slide.querySelectorAll('img[src]')) {
@@ -796,7 +873,9 @@ async function fetchAsDataUrl(src) {
 
 log(`ℹ Mode: ${opts.mode}  ·  serving ${HTML_FILE} on :${port}`);
 
-const browser = await chromium.launch();
+const browser = await chromium.launch(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
+  ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE }
+  : undefined);
 const context = await browser.newContext({
   viewport: { width: 1920, height: 1080 },
   deviceScaleFactor: opts.scale,
@@ -856,6 +935,14 @@ try {
         hideImages: opts.nativeImages,
       });
       await page.waitForTimeout(60);
+
+      for (const [j, raster] of (data.rasters || []).entries()) {
+        const handle = await page.$(`[data-slides-pptx-raster-id="${raster.id}"]`);
+        if (!handle) continue;
+        const rasterShot = join(shotDir, `slide-${String(i + 1).padStart(3, '0')}-raster-${String(j + 1).padStart(2, '0')}.png`);
+        await handle.screenshot({ path: rasterShot, type: 'png' });
+        raster.shot = rasterShot;
+      }
     }
 
     const ext = opts.jpeg ? 'jpg' : 'png';
@@ -912,15 +999,30 @@ for (const [i, s] of slidesData.entries()) {
 
   /* Background artwork — full-bleed, and in image/searchable mode this IS the slide. */
   const altBase = s.title ? `Slide ${i + 1}: ${s.title}` : `Slide ${i + 1}`;
-  slide.addImage({
-    path: s.shot,
-    x: 0, y: 0, w: SLIDE_W_IN, h: SLIDE_H_IN,
-    // Screen readers announce alt text; for an image-only slide it is the only
-    // machine-readable content, so include the slide's words.
-    altText: opts.mode === 'image'
-      ? [altBase, s.allText].filter(Boolean).join(' — ').slice(0, 2000)
-      : `${altBase} (background)`,
-  });
+  if (opts.backgroundArt) {
+    slide.addImage({
+      path: s.shot,
+      x: 0, y: 0, w: SLIDE_W_IN, h: SLIDE_H_IN,
+      // Screen readers announce alt text; for an image-only slide it is the only
+      // machine-readable content, so include the slide's words.
+      altText: opts.mode === 'image'
+        ? [altBase, s.allText].filter(Boolean).join(' — ').slice(0, 2000)
+        : `${altBase} (background)`,
+    });
+  }
+
+  /* Cropped raster figures — preserves complex HTML/CSS charts without setting a
+     manual slide background or duplicating the editable text layer. */
+  if (opts.mode === 'editable') {
+    for (const raster of s.rasters || []) {
+      if (!raster.shot) continue;
+      slide.addImage({
+        path: raster.shot,
+        x: inch(raster.x), y: inch(raster.y), w: inch(raster.w), h: inch(raster.h),
+        altText: raster.alt || 'Figure',
+      });
+    }
+  }
 
   /* Native images lifted out of the artwork (editable mode only). */
   if (opts.mode === 'editable' && opts.nativeImages) {
@@ -958,10 +1060,13 @@ for (const [i, s] of slidesData.entries()) {
       const runs = [];
       lines.forEach((line, li) => {
         const notLast = li < lines.length - 1;
+        const paragraphBullet = t.listType
+          ? (t.listType === 'number' ? { type: 'number' } : true)
+          : undefined;
         if (!line.length) {
           // An empty line still needs a run to carry the paragraph, or the blank
           // line vanishes and the following text moves up.
-          runs.push({ text: '', options: { breakLine: notLast, fontSize: pt(12) } });
+          runs.push({ text: '', options: { breakLine: notLast, fontSize: pt(12), bullet: paragraphBullet } });
           return;
         }
         line.forEach((r, ri) => {
@@ -979,6 +1084,7 @@ for (const [i, s] of slidesData.entries()) {
               transparency: invisible ? 100 : (st.alpha < 1 ? Math.round((1 - st.alpha) * 100) : undefined),
               charSpacing: st.letterSpacingPx ? round4(st.letterSpacingPx * fit * PX_TO_PT) : undefined,
               breakLine: notLast && ri === line.length - 1,
+              bullet: t.listType && ri === 0 ? paragraphBullet : undefined,
             },
           });
         });
@@ -989,7 +1095,7 @@ for (const [i, s] of slidesData.entries()) {
         x: inch(t.x), y: inch(t.y), w: inch(t.w), h: inch(t.h),
         align: t.align === 'justify' ? 'justify' : t.align,
         valign: 'top',
-        margin: 0,          // PowerPoint's default inset would shift every box
+        margin: t.listType ? 0.04 : 0,          // PowerPoint's default inset would shift every box
         wrap: !t.nowrap,    // single-line text must not reflow on a different renderer
         autoFit: false,     // keep the measured size; never let PowerPoint rescale silently
         lineSpacing: t.lineHeightPx ? round4(t.lineHeightPx * fit * PX_TO_PT) : undefined,
@@ -1025,9 +1131,14 @@ await pptx.writeFile({ fileName: OUTPUT });
       notesMasterIdLst after sldIdLst.
    2. CT_TextParagraph allows at most one <a:pPr>, as the first child.
       pptxgenjs repeats it before every run in a multi-run paragraph.
-   3. pptxgenjs can leave stale content-type overrides behind for parts that no
+   3. pptxgenjs points the notes master at the same theme part used by the
+      presentation/slide master. PowerPoint repairs this by creating a dedicated
+      notes theme part and retargeting the notes-master relationship.
+   4. pptxgenjs emits empty text runs in blank notes placeholders. PowerPoint
+      removes these during repair/save, so remove them before handoff.
+   5. pptxgenjs can leave stale content-type overrides behind for parts that no
       longer exist after master/layout de-duplication. PowerPoint repairs those.
-   4. Zip directory entries are harmless to most readers but are noise in a PPTX
+   6. Zip directory entries are harmless to most readers but are noise in a PPTX
       package and PowerPoint rewrites them during repair.
    ═══════════════════════════════════════════════════════════ */
 
@@ -1065,8 +1176,55 @@ for (const name of Object.keys(zip.files)) {
 }
 if (dupParagraphs) repairs.push(`${dupParagraphs} duplicate <a:pPr>`);
 
-// --- 3. Stale content-type overrides ---
+// --- 3. Dedicated notes-master theme ---
+// PowerPoint-created decks keep the notes master on its own theme part. pptxgenjs
+// reuses theme1.xml, which validates against ECMA-376 but triggers PowerPoint's
+// repair pass on some Office builds. Mirroring PowerPoint's package shape avoids
+// the repair prompt while keeping the same visual theme.
 let contentTypesXml = await zip.file('[Content_Types].xml')?.async('string');
+const THEME_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.theme+xml';
+const hasOverride = (xml, partName) => new RegExp(`<Override\\s+PartName="/${partName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"\\s+ContentType="[^"]+"\\s*/>`).test(xml);
+const ensureOverride = (xml, partName, contentType) => {
+  const escaped = partName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`<Override\\s+PartName="/${escaped}"\\s+ContentType="[^"]+"\\s*/>`);
+  const entry = `<Override PartName="/${partName}" ContentType="${contentType}"/>`;
+  if (re.test(xml)) return xml.replace(re, entry);
+  return xml.replace('</Types>', `  ${entry}\n</Types>`);
+};
+
+const notesMasterRelsPath = 'ppt/notesMasters/_rels/notesMaster1.xml.rels';
+let notesMasterRelsXml = await zip.file(notesMasterRelsPath)?.async('string');
+if (notesMasterRelsXml && zip.file('ppt/theme/theme1.xml')) {
+  const notesThemeRel = notesMasterRelsXml.match(/<Relationship\b[^>]*Type="http:\/\/schemas\.openxmlformats\.org\/officeDocument\/2006\/relationships\/theme"[^>]*Target="([^"]+)"[^>]*\/>/);
+  if (notesThemeRel?.[1] === '../theme/theme1.xml') {
+    if (!zip.file('ppt/theme/theme2.xml')) {
+      zip.file('ppt/theme/theme2.xml', await zip.file('ppt/theme/theme1.xml').async('string'));
+    }
+    notesMasterRelsXml = notesMasterRelsXml.replace(notesThemeRel[0], notesThemeRel[0].replace('Target="../theme/theme1.xml"', 'Target="../theme/theme2.xml"'));
+    zip.file(notesMasterRelsPath, notesMasterRelsXml);
+    if (contentTypesXml && !hasOverride(contentTypesXml, 'ppt/theme/theme2.xml')) {
+      contentTypesXml = ensureOverride(contentTypesXml, 'ppt/theme/theme2.xml', THEME_CONTENT_TYPE);
+      zip.file('[Content_Types].xml', contentTypesXml);
+    }
+    repairs.push('dedicated notes-master theme');
+  }
+}
+
+// --- 4. Empty notes text runs ---
+const EMPTY_TEXT_RUN = /<a:r>\s*<a:rPr(?:\s[^>]*)?\/>\s*<a:t(?:\s*\/|><\/a:t>)\s*<\/a:r>/g;
+let emptyNotesRuns = 0;
+for (const name of Object.keys(zip.files)) {
+  if (!/^ppt\/notesSlides\/notesSlide\d+\.xml$/.test(name)) continue;
+  const xml = await zip.file(name).async('string');
+  const matches = xml.match(EMPTY_TEXT_RUN);
+  if (!matches) continue;
+  zip.file(name, xml.replace(EMPTY_TEXT_RUN, ''));
+  emptyNotesRuns += matches.length;
+}
+if (emptyNotesRuns) repairs.push(`${emptyNotesRuns} empty notes text run${emptyNotesRuns === 1 ? '' : 's'}`);
+
+// --- 5. Stale content-type overrides ---
+contentTypesXml = await zip.file('[Content_Types].xml')?.async('string');
 if (contentTypesXml) {
   let staleOverrides = 0;
   const fixed = contentTypesXml.replace(/<Override\s+PartName="([^"]+)"\s+ContentType="[^"]+"\s*\/>/g, (entry, partName) => {
@@ -1081,7 +1239,7 @@ if (contentTypesXml) {
   }
 }
 
-// --- 4. Directory entries ---
+// --- 6. Directory entries ---
 let directoryEntries = 0;
 for (const [name, entry] of Object.entries(zip.files)) {
   if (!entry.dir) continue;

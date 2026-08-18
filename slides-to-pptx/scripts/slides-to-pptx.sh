@@ -14,6 +14,7 @@
 #   --scale N                          Screenshot pixel ratio (default 2; use 1 for smaller files)
 #   --jpeg [quality]                   JPEG artwork instead of PNG — much smaller, softer text
 #   --native-images                    editable mode: lift <img> tags out as replaceable pictures
+#   --no-background-art                editable mode: omit full-slide screenshot artwork
 #   --keep-chrome                      Keep nav arrows / page counters / edit UI in the artwork
 #   --keep-shots <dir>                 Keep the slide screenshots for visual verification
 #   --font-map "Clash Display=Impact"  Override the built-in webfont substitutions
@@ -62,7 +63,7 @@ while [[ $# -gt 0 ]]; do
         --jpeg)
             PASSTHROUGH+=("$1"); shift
             if [[ ${1:-} =~ ^[0-9]+$ ]]; then PASSTHROUGH+=("$1"); shift; fi ;;
-        --native-images|--keep-chrome|--no-notes|--no-links|--no-shrink)
+        --native-images|--no-background-art|--keep-chrome|--no-notes|--no-links|--no-shrink)
             PASSTHROUGH+=("$1"); shift ;;
         -*) err "Unknown option: $1"; exit 1 ;;
         *)  POSITIONAL+=("$1"); shift ;;

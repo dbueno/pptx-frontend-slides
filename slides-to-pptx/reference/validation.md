@@ -20,9 +20,11 @@ reject or render wrong. Two of the three schema bugs this validator catches are 
 
 Zip integrity, the four required parts (`[Content_Types].xml`, `_rels/.rels`,
 `ppt/presentation.xml`, `ppt/_rels/presentation.xml.rels`), every `r:id` resolving to a declared
-relationship, and every internal relationship target existing in the package.
+relationship, every internal relationship target existing in the package, and package patterns
+that make desktop PowerPoint open with a repair prompt.
 
-**Catches:** truncated downloads, broken hand-edits, missing media.
+**Catches:** truncated downloads, broken hand-edits, missing media, missing theme content types,
+shared notes-master themes, and empty notes text runs.
 
 ### 2. Deck geometry
 
@@ -74,8 +76,8 @@ this.
 
 ## Known pptxgenjs bugs, repaired automatically
 
-The converter repairs both in the written package and reports what it fixed. Both are present in
-pptxgenjs 4.0.1 and affect **every** file it produces.
+The converter repairs these in the written package and reports what it fixed. They are present in
+pptxgenjs 4.0.1 and affect most or all files it produces.
 
 ### `<p:notesMasterIdLst>` in the wrong position
 
@@ -103,6 +105,20 @@ pptxgenjs emits a fresh identical `<a:pPr>` before each run:
 The fix keeps the first and drops the repeats. Since the duplicates are byte-identical, the
 paragraph's formatting is unchanged.
 
+### Notes master shares `theme1.xml`
+
+pptxgenjs wires `ppt/notesMasters/_rels/notesMaster1.xml.rels` to `../theme/theme1.xml`, the
+same theme part used by the slide master and presentation. Some desktop PowerPoint builds pass
+schema validation but still repair the package on open, creating `ppt/theme/theme2.xml` and
+retargeting the notes master to that dedicated theme. The converter now mirrors that package
+shape up front and adds the required theme content-type override.
+
+### Empty notes text runs
+
+pptxgenjs emits empty `<a:r><a:t/></a:r>` runs in blank notes placeholders. PowerPoint removes
+them during repair/save. The converter removes them before writing the final file so a deck with
+speaker-note parts opens cleanly.
+
 ## Interpreting a failure
 
 | Message | Meaning | Fix |
@@ -114,6 +130,8 @@ paragraph's formatting is unchanged.
 | `slide N: no text runs (expected with --expect-text)` | Text extraction found nothing | Text may be inside canvas/SVG, or the slide is genuinely image-only |
 | `slide N: references missing media` | Broken relationship | Re-run the conversion |
 | `multiple <a:pPr>` | The pptxgenjs bug above | Should be auto-repaired; report if it survives |
+| `shares theme part` | Notes master reuses `theme1.xml` | Should be auto-repaired; report if it survives |
+| `empty notes text run` | Blank notes placeholder has an empty run | Should be auto-repaired; report if it survives |
 | `schema: …` | Any other ECMA-376 violation | Not a known bug — report the exact message |
 
 ## Warnings worth mentioning to the user

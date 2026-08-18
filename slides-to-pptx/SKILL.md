@@ -246,7 +246,8 @@ instead via the frontend-slides skill.
 | Editable text looks slightly small | The shrink pass fitted it to the substituted font | Expected; `--no-shrink` restores authored sizes and accepts the overflow |
 | `overlap` findings on a flex/grid-heavy deck | A container's border box spans its children | The converter uses the glyphs' own rect here; confirm against `--preview` before reporting |
 | Words glued together, or `<pre>` lines merged | An old build — whitespace-only text nodes were being dropped | Fixed; re-run with the current scripts |
-| `schema: ... unexpected child element` | A pptxgenjs output bug | The converter auto-repairs the two known ones; report anything else |
+| `schema: ... unexpected child element` | A pptxgenjs output bug | The converter auto-repairs the known ones; report anything else |
+| `shares theme part` or `empty notes text run` | A PowerPoint-repair-prone notes package shape | The converter should auto-repair it; re-run and report if it survives |
 
 ---
 
@@ -273,7 +274,7 @@ Worth knowing when something goes wrong:
    reflow it.
 8. In `editable` mode each box is measured a second time with its substituted font applied, in
    an off-screen clone, and the font size stepped down until it fits (floor 80%).
-9. Two known pptxgenjs schema bugs are repaired in the written package (see
+9. Known pptxgenjs schema bugs and PowerPoint-repair-prone notes/theme wiring are repaired in the written package (see
    [reference/validation.md](reference/validation.md)).
 
 ---
